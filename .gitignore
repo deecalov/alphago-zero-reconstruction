@@ -1,0 +1,27 @@
+# Generated training and self-play artifacts
+runs/
+*.pt
+
+# Python packages, test output and tool caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local environments and editors
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.cursor/
+.vscode/
+.idea/

@@ -1,0 +1,279 @@
+# Frozen Gumbel implementation from before the search fast paths.
+#
+# Reference Gumbel search uses the original PUCT base in frozen_mcts_v1.
+# `.config/.network` -> `alphago_zero.*`, `.mcts` -> `frozen_mcts_v1`.
+# Keep reference behavior stable for bitwise differential tests.
+# (tests/test_search_fast_paths.py).
+"""Gumbel AlphaZero search based on Danihelka et al. Root candidates compete under Sequential Halving and
+interior nodes track the improved policy.
+"""
+
+from __future__ import annotations
+
+import math
+from functools import lru_cache
+
+import numpy as np
+
+from alphago_zero.config import SearchConfig
+from alphago_zero.network import PolicyValueModel
+from frozen_mcts_v1 import (
+    AlphaGoZeroMCTS,
+    MCTSNode,
+    SearchOutput,
+    root_visit_statistics,
+)
+
+# Floor priors before taking logs. A float32 underflow must not introduce infinities or NaNs.
+_TINY = float(np.finfo(np.float32).tiny)
+# Floor eligible scores to keep negative infinity reserved for ineligible visit counts.
+_LOW_LOGIT = -1e9
+# Avoid division by zero when all completed Q values are equal.
+_EPSILON = 1e-8
+
+
+# ----------------------------------------------------------------------
+# Pure search mathematics, checked against mctx reference formulas.
+# ----------------------------------------------------------------------
+@lru_cache(maxsize=None)
+def considered_visit_sequence(max_considered: int, num_simulations: int) -> tuple[int, ...]:
+    """Return the eligible visit count for each simulation in a Sequential Halving schedule."""
+    if max_considered <= 1:
+        return tuple(range(num_simulations))
+    log2max = int(math.ceil(math.log2(max_considered)))
+    sequence: list[int] = []
+    visits = [0] * max_considered
+    num_considered = max_considered
+    while len(sequence) < num_simulations:
+        num_extra_visits = max(1, int(num_simulations / (log2max * num_considered)))
+        for _ in range(num_extra_visits):
+            sequence.extend(visits[:num_considered])
+            for index in range(num_considered):
+                visits[index] += 1
+        num_considered = max(2, num_considered // 2)
+    return tuple(sequence[:num_simulations])
+
+
+def mixed_value(
+    raw_value: float,
+    q_values: np.ndarray,
+    visit_counts: np.ndarray,
+    prior_probs: np.ndarray,
+) -> float:
+    """Mix the network value with the prior-weighted mean Q of visited actions. The network value has weight
+    one and the visited estimate has weight equal to the total visits.
+    """
+    visited = visit_counts > 0
+    if not visited.any():
+        return float(raw_value)
+    total_visits = float(visit_counts.sum())
+    probs = np.maximum(prior_probs[visited], _TINY)
+    weighted_q = float((probs * q_values[visited]).sum() / probs.sum())
+    return float((raw_value + total_visits * weighted_q) / (total_visits + 1.0))
+
+
+def completed_q_scores(
+    raw_value: float,
+    q_values: np.ndarray,
+    visit_counts: np.ndarray,
+    prior_probs: np.ndarray,
+    c_visit: float,
+    c_scale: float,
+) -> np.ndarray:
+    """Fill unvisited actions with the mixed value, normalize the completed Q values and apply the
+    visit-dependent scale.
+    """
+    completed = np.where(
+        visit_counts > 0,
+        q_values,
+        mixed_value(raw_value, q_values, visit_counts, prior_probs),
+    )
+    lowest = float(completed.min())
+    spread = max(float(completed.max()) - lowest, _EPSILON)
+    rescaled = (completed - lowest) / spread
+    return (c_visit + float(visit_counts.max())) * c_scale * rescaled
+
+
+def score_considered(
+    considered_visit: float,
+    gumbel: np.ndarray,
+    logits: np.ndarray,
+    sigma_q: np.ndarray,
+    visit_counts: np.ndarray,
+) -> np.ndarray:
+    """Score eligible root candidates by Gumbel noise plus prior logit plus transformed Q."""
+    shifted = logits - logits.max()
+    penalty = np.where(visit_counts == considered_visit, 0.0, -np.inf)
+    return np.maximum(_LOW_LOGIT, gumbel + shifted + sigma_q) + penalty
+
+
+def _softmax(values: np.ndarray) -> np.ndarray:
+    exp = np.exp(values - values.max())
+    return exp / exp.sum()
+
+
+def _edge_view(node: MCTSNode) -> tuple[list[int], np.ndarray, np.ndarray, np.ndarray]:
+    """Collect actions, priors, visits and mean Q. Include in-flight visits and their temporary virtual losses."""
+    edges = node.edges
+    count = len(edges)
+    actions = list(edges)
+    priors = np.fromiter((edge.prior for edge in edges.values()), dtype=np.float64, count=count)
+    visits = np.fromiter((edge.visit_count for edge in edges.values()), dtype=np.float64, count=count)
+    sums = np.fromiter((edge.value_sum for edge in edges.values()), dtype=np.float64, count=count)
+    q_values = np.divide(sums, visits, out=np.zeros(count, dtype=np.float64), where=visits > 0)
+    return actions, priors, visits, q_values
+
+
+class GumbelMCTS(AlphaGoZeroMCTS):
+    """Use Gumbel-Top-k and Sequential Halving at the root and improved-policy selection inside the tree.
+    Reuse the base search's batched leaf evaluation and backup.
+    """
+
+    def __init__(
+        self,
+        model: PolicyValueModel,
+        config: SearchConfig,
+        rng: np.random.Generator,
+    ) -> None:
+        super().__init__(model, config, rng)
+        # Per-move root, simulation budget and noise in root edge order.
+        self._root: MCTSNode | None = None
+        self._budget: int = config.num_simulations
+        self._gumbel: np.ndarray = np.zeros(0, dtype=np.float64)
+
+    # ------------------------------------------------------------------
+    # AlphaGoZeroMCTS extension points
+    # ------------------------------------------------------------------
+    def _prepare_root(self, root: MCTSNode, num_simulations: int, add_noise: bool) -> None:
+        """Initialize the root budget and candidate noise. Disabling noise makes this step deterministic."""
+        if any(edge.visit_count for edge in root.edges.values()):
+            raise ValueError(
+                "Gumbel search requires an unvisited root. Sequential Halving schedules "
+                "visits from zero and cannot reuse a previous tree"
+            )
+        count = len(root.edges)
+        scale = float(self.config.gumbel_scale)
+        if add_noise and scale > 0.0 and count:
+            noise = scale * self.rng.gumbel(size=count)
+        else:
+            noise = np.zeros(count, dtype=np.float64)
+        self._root = root
+        self._budget = int(num_simulations)
+        self._gumbel = noise
+
+    def _select_leaf(self, root: MCTSNode) -> tuple[MCTSNode, list[tuple[MCTSNode, int]]]:
+        """Select a leaf and initialize an unprepared root without noise for direct callers."""
+        if root is not self._root:
+            self._prepare_root(root, self.config.num_simulations, add_noise=False)
+        return super()._select_leaf(root)
+
+    def _select_action(self, node: MCTSNode) -> int:
+        """Use Sequential Halving at the root and improved-policy selection elsewhere."""
+        if node is self._root:
+            return self._select_root_action(node)
+        return self._select_interior_action(node)
+
+    def advance_root(self, root: MCTSNode | None, action: int) -> MCTSNode | None:
+        """Start a fresh tree for each Gumbel move."""
+        return None
+
+    def summarize(self, root: MCTSNode, temperature: float) -> SearchOutput:
+        """Return the Sequential Halving winner as the move and the improved root policy as the learning target."""
+        visit_counts, root_q = root_visit_statistics(root)
+        policy = np.zeros_like(visit_counts)
+        improved = np.zeros_like(visit_counts)
+        if not root.edges:
+            return SearchOutput(
+                policy=policy,
+                visit_counts=visit_counts,
+                root=root,
+                root_value=float(root.node_value),
+                best_child_q=float(root.node_value),
+                root_q=root_q,
+                improved_policy=improved,
+            )
+
+        actions, priors, visits, q_values = _edge_view(root)
+        logits = np.log(np.maximum(priors, _TINY))
+        sigma = completed_q_scores(
+            root.node_value, q_values, visits, _softmax(logits),
+            self.config.gumbel_c_visit, self.config.gumbel_c_scale,
+        )
+        # Among the most visited actions, maximize noise + logit + transformed Q.
+        scores = score_considered(
+            float(visits.max()), self._gumbel_for(root, len(actions)), logits, sigma, visits
+        )
+        policy[actions[int(np.argmax(scores))]] = 1.0
+        improved[actions] = _softmax(logits + sigma).astype(np.float32)
+
+        visited = visits > 0
+        total_visits = float(visits.sum())
+        if not visited.any() or total_visits < self.config.resign_min_visits:
+            best_child_q = 1.0  # Conservative sentinel when the search has too little evidence.
+        else:
+            best_child_q = float(q_values[visited].max())
+        return SearchOutput(
+            policy=policy,
+            visit_counts=visit_counts,
+            root=root,
+            root_value=float(root.node_value),
+            best_child_q=best_child_q,
+            root_q=root_q,
+            improved_policy=improved,
+        )
+
+    # ------------------------------------------------------------------
+    # Edge selection
+    # ------------------------------------------------------------------
+    def _gumbel_for(self, root: MCTSNode, count: int) -> np.ndarray:
+        """Return root noise, or zeros for a different root or incompatible action count."""
+        if root is self._root and len(self._gumbel) == count:
+            return self._gumbel
+        return np.zeros(count, dtype=np.float64)
+
+    def _select_root_action(self, root: MCTSNode) -> int:
+        """Choose the next root action under Sequential Halving."""
+        actions, priors, visits, q_values = _edge_view(root)
+        logits = np.log(np.maximum(priors, _TINY))
+        sigma = completed_q_scores(
+            root.node_value, q_values, visits, _softmax(logits),
+            self.config.gumbel_c_visit, self.config.gumbel_c_scale,
+        )
+        considered = min(self.config.gumbel_max_considered, len(actions))
+        sequence = considered_visit_sequence(considered, max(1, self._budget))
+        # The simulation index includes pending root visits.
+        index = min(int(visits.sum()), len(sequence) - 1)
+        scores = score_considered(
+            sequence[index], self._gumbel_for(root, len(actions)), logits, sigma, visits
+        )
+        best = int(np.argmax(scores))
+        if scores[best] == -np.inf:
+            # The schedule must admit a candidate. An unrestricted argmax could silently select an ineligible
+            # action.
+            raise RuntimeError(
+                "Sequential Halving: no candidate with visit count "
+                f"{sequence[index]} (root counts: {visits.astype(int).tolist()})"
+            )
+        return actions[best]
+
+    def _select_interior_action(self, node: MCTSNode) -> int:
+        """Choose the action maximizing improved probability minus N(a)/(1 + total visits)."""
+        actions, priors, visits, q_values = _edge_view(node)
+        logits = np.log(np.maximum(priors, _TINY))
+        sigma = completed_q_scores(
+            node.node_value, q_values, visits, _softmax(logits),
+            self.config.gumbel_c_visit, self.config.gumbel_c_scale,
+        )
+        improved = _softmax(logits + sigma)
+        return actions[int(np.argmax(improved - visits / (1.0 + visits.sum())))]
+
+
+def make_self_play_search(
+    model: PolicyValueModel,
+    config: SearchConfig,
+    rng: np.random.Generator,
+) -> AlphaGoZeroMCTS:
+    """Construct the trainable side's self-play search from config.search_algo for both game drivers."""
+    if config.search_algo == "gumbel":
+        return GumbelMCTS(model, config, rng)
+    return AlphaGoZeroMCTS(model, config, rng)
